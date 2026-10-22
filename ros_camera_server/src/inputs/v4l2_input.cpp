@@ -327,6 +327,70 @@ StreamInput V4l2InputConfiguration::createInput( const rclcpp::Node::SharedPtr &
   return { input_bin, stream_format, state };
 }
 
+namespace
+{
+
+// Fixed int, an int range that contains desired (honoring step), or a
+// GstValueList of those. v4l2src sometimes groups discrete sizes into a list.
+bool dimensionValueMatches( const GValue *value, int desired )
+{
+  if ( G_VALUE_HOLDS_INT( value ) )
+    return g_value_get_int( value ) == desired;
+
+  if ( GST_VALUE_HOLDS_INT_RANGE( value ) ) {
+    int min_v = gst_value_get_int_range_min( value );
+    int max_v = gst_value_get_int_range_max( value );
+    int step = gst_value_get_int_range_step( value );
+    if ( desired < min_v || desired > max_v || ( step > 1 && ( desired - min_v ) % step != 0 ) )
+      return false;
+    return true;
+  }
+
+  if ( GST_VALUE_HOLDS_LIST( value ) ) {
+    for ( guint i = 0; i < gst_value_list_get_size( value ); ++i ) {
+      if ( dimensionValueMatches( gst_value_list_get_value( value, i ), desired ) )
+        return true;
+    }
+  }
+
+  return false;
+}
+
+// Fixed fraction, a fraction range that contains desired, or a GstValueList of
+// those (lists may nest). UVC cameras advertise discrete framerates as a list
+// of fractions, not a single fraction or a range.
+bool framerateValueMatches( const GValue *value, const Framerate &desired )
+{
+  if ( GST_VALUE_HOLDS_FRACTION( value ) ) {
+    Framerate cap_fr( gst_value_get_fraction_numerator( value ),
+                      gst_value_get_fraction_denominator( value ) );
+    return cap_fr == desired;
+  }
+
+  if ( GST_VALUE_HOLDS_FRACTION_RANGE( value ) ) {
+    const GValue *min_fr = gst_value_get_fraction_range_min( value );
+    const GValue *max_fr = gst_value_get_fraction_range_max( value );
+    Framerate min_framerate( gst_value_get_fraction_numerator( min_fr ),
+                             gst_value_get_fraction_denominator( min_fr ) );
+    Framerate max_framerate( gst_value_get_fraction_numerator( max_fr ),
+                             gst_value_get_fraction_denominator( max_fr ) );
+    if ( desired < min_framerate || desired > max_framerate )
+      return false;
+    return true;
+  }
+
+  if ( GST_VALUE_HOLDS_LIST( value ) ) {
+    for ( guint i = 0; i < gst_value_list_get_size( value ); ++i ) {
+      if ( framerateValueMatches( gst_value_list_get_value( value, i ), desired ) )
+        return true;
+    }
+  }
+
+  return false;
+}
+
+} // namespace
+
 GstCaps *V4l2InputConfiguration::selectCaps( GstElement *src ) const
 {
   if ( gst_element_set_state( src, GST_STATE_READY ) != GST_STATE_CHANGE_SUCCESS ) {
@@ -364,60 +428,21 @@ GstCaps *V4l2InputConfiguration::selectCaps( GstElement *src ) const
       continue;
     }
 
-    // Check width - must be fixed and matching, or a range containing the desired value
+    // Width and height: fixed, a range containing the value, or a list of those.
     const GValue *width_value = gst_structure_get_value( structure, "width" );
-    if ( !width_value ) {
+    if ( !width_value || !dimensionValueMatches( width_value, width ) )
       continue;
-    } else if ( G_VALUE_HOLDS_INT( width_value ) ) {
-      if ( g_value_get_int( width_value ) != width )
-        continue;
-    } else if ( GST_VALUE_HOLDS_INT_RANGE( width_value ) ) {
-      int min_w = gst_value_get_int_range_min( width_value );
-      int max_w = gst_value_get_int_range_max( width_value );
-      int step_w = gst_value_get_int_range_step( width_value );
-      if ( width < min_w || width > max_w || ( step_w > 1 && ( width - min_w ) % step_w != 0 ) )
-        continue;
-    } else {
-      continue;
-    }
 
-    // Check height - same logic
     const GValue *height_value = gst_structure_get_value( structure, "height" );
-    if ( !height_value ) {
+    if ( !height_value || !dimensionValueMatches( height_value, height ) )
       continue;
-    } else if ( G_VALUE_HOLDS_INT( height_value ) ) {
-      if ( g_value_get_int( height_value ) != height )
-        continue;
-    } else if ( GST_VALUE_HOLDS_INT_RANGE( height_value ) ) {
-      int min_h = gst_value_get_int_range_min( height_value );
-      int max_h = gst_value_get_int_range_max( height_value );
-      int step_h = gst_value_get_int_range_step( height_value );
-      if ( height < min_h || height > max_h || ( step_h > 1 && ( height - min_h ) % step_h != 0 ) )
-        continue;
-    } else {
-      continue;
-    }
 
-    // Check framerate - must be fixed and matching, or a range containing the desired value
+    // Framerate: fixed, a range containing the value, or a list of fractions
+    // (and nested lists). No framerate field means the device does not constrain it.
     if ( gst_structure_has_field( structure, "framerate" ) ) {
       const GValue *fr_value = gst_structure_get_value( structure, "framerate" );
-      if ( GST_VALUE_HOLDS_FRACTION( fr_value ) ) {
-        Framerate cap_fr;
-        gst_structure_get_fraction( structure, "framerate", &cap_fr.numerator, &cap_fr.denominator );
-        if ( cap_fr != framerate )
-          continue;
-      } else if ( GST_VALUE_HOLDS_FRACTION_RANGE( fr_value ) ) {
-        const GValue *min_fr = gst_value_get_fraction_range_min( fr_value );
-        const GValue *max_fr = gst_value_get_fraction_range_max( fr_value );
-        Framerate min_framerate( gst_value_get_fraction_numerator( min_fr ),
-                                 gst_value_get_fraction_denominator( min_fr ) );
-        Framerate max_framerate( gst_value_get_fraction_numerator( max_fr ),
-                                 gst_value_get_fraction_denominator( max_fr ) );
-        if ( framerate < min_framerate || framerate > max_framerate )
-          continue;
-      } else {
+      if ( !fr_value || !framerateValueMatches( fr_value, framerate ) )
         continue;
-      }
     }
 
     // This caps structure matches - fix up ranges to exact values and aggregate
